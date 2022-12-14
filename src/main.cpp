@@ -6,49 +6,55 @@
  *
  * https://github.com/maxgerhardt/platform-raspberrypi
  * https://github.com/earlephilhower/arduino-pico
+ * https://components101.com/development-boards/raspberry-pi-pico-w
  *******************************************************************************/
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
 
-//#include <NTPClient.h>
-//#include <PubSubClient.h>
-
 #include <ArduinoMqttClient.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 
-#ifndef STASSID
+#ifndef SECRET_SSID
 #include "arduino_secrets.h"
 #endif
 
-const char *ssid = STASSID;
-const char *password = STAPSK;
+const int waterAutoOn = 60UL; // in sec. Auto water/ day
 
-const int msgPeriod = 1 * 1000U;
+const char *ssid = SECRET_SSID;
+const char *password = SECRET_PASS;
+
+const int HL_PIN = A0; // PICO pin 31
+const int HR_PIN = A1; // PICO pin 32
+const int relayPin = 22; // PICO pin 292
+
+const int msgPeriod = 5 * 1000U;
 const int wifiPeriod = 300 * 1000U;
+const int ledPeriod = 2 * 1000U;
 
-const char* mqtt_broker = "test.mosquitto.org";
+const char* mqttBroker = "test.mosquitto.org";
 const int mqtt_port = 1883;  // Sets the server details.
 // const char* mqtt_server = "91.121.93.94";
 const char* ntpServer = "ntp1.tecnico.ulisboa.pt";
 // int        port        = 1883;
 const char willTopic[] = "ipfn/will";
-const char inTopic[]   = "ipfn/in";
-const char outTopic[]  = "ipfn/out";
+const char inTopic[]   = "ipfn/picoW/in";
+const char outTopic[]  = "ipfn/picoW/out";
 
 WiFiClient wClient;
-WiFiUDP ntpUDP;
 
 // By default 'pool.ntp.org' is used with 60 seconds update interval and
-// no offset
-//NTPClient timeClient(ntpUDP);
 
-//PubSubClient PmqttClient(wClient);
 MqttClient mqttClient(wClient);
 
 bool led_state = false;
+bool led_blink = false;
 int count = 0;
+
+unsigned int sumWater = 0;
+unsigned long stopPump = 0, nextWater;
 
 const long gmtOffset_sec     = 0;
 const int daylightOffset_sec = 0; // 3600;
@@ -57,55 +63,68 @@ const int daylightOffset_sec = 0; // 3600;
 
 #define MSG_BUFFER_SIZE 50
 char msg[MSG_BUFFER_SIZE];
-bool wifiOK = false;
+int wifiOK = 0;
 bool ntpOK = false;
-//
+bool relayState = false;
 
 void reconnect_wifi() {
     delay(10);
+    if (WiFi.status() == WL_CONNECTED)
+        return;
+
+    wifiOK = 0;
     // We start by connecting to a WiFi network
     Serial.println();
     Serial.print("Connecting to ");
     Serial.println(ssid);
 
-    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
     WiFi.begin(ssid, password);
-    // WiFi.reconnect()
 
+    led_state = false;
+    led_blink = false;
     for(int i = 0; i < WIFI_RETRY; i++){
-        //while (WiFi.status() != WL_CONNECTED) {
+        //while (WiFi.status() != WL_CONNECTED)
         if (WiFi.status() != WL_CONNECTED) {
             Serial.print(".");
             led_state = not led_state;
             digitalWrite(LED_BUILTIN, led_state);
             delay(500);
-            continue;
+            //continue;
         }
-        //else {
-        wifiOK = true;
-        led_state = false;
-        //timeClient.begin();
-        Serial.println("");
-        Serial.println("WiFi connected");
-        Serial.println("IP address: ");
-        Serial.println(WiFi.localIP());
-        digitalWrite(LED_BUILTIN, led_state);
-        break;
-        //}
+        else {
+            wifiOK = 1;
+            led_state = true;
+            led_blink = true;
+            //timeClient.begin();
+            Serial.println("");
+            Serial.println("WiFi connected");
+            Serial.println("IP address: ");
+            Serial.println(WiFi.localIP());
+            digitalWrite(LED_BUILTIN, led_state);
+            break;
+        }
     }
 }
 
-void setClock() {
-    NTP.begin("pool.ntp.org", "time.nist.gov");
-    NTP.waitSet(2000);
+void setClockNtp(uint32_t timeout) {
+    NTP.begin(ntpServer, "pool.ntp.org");
+    NTP.waitSet(timeout);
     time_t now = time(nullptr);
     struct tm timeinfo;
-    gmtime_r(&now, &timeinfo);
-    Serial.print("Current time: ");
-    Serial.print(asctime(&timeinfo));
+    if(now < 8 * 3600 * 2){
+        Serial.println("Could not get ntp time");
+    }
+    else{
+        gmtime_r(&now, &timeinfo);
+        Serial.print("Current ntp time: ");
+        Serial.print(asctime(&timeinfo));
+    }
 }
 
 void onMqttMessage(int messageSize) {
+    StaticJsonDocument<256> doc;
+
     // we received a message, print out the topic and contents
     Serial.print("Received a message with topic '");
     Serial.print(mqttClient.messageTopic());
@@ -119,23 +138,38 @@ void onMqttMessage(int messageSize) {
     Serial.print(messageSize);
     Serial.println(" bytes:");
 
-    // use the Stream interface to print the contents
-    while (mqttClient.available()) {
-        Serial.print((char)mqttClient.read());
+    deserializeJson(doc, mqttClient);
+
+    Serial.print(", Pump: ");
+    int pump = doc["pump"];
+    unsigned long now = millis();
+    if (pump == 1){
+        nextWater = now + 2000UL;
     }
+    Serial.print(pump);
+
+    // use the Stream interface to print the contents
+    /*
+       while (mqttClient.available()) {
+       Serial.print((char)mqttClient.read());
+       }
+       */
     Serial.println();
 
 }
 // The normal, core0 setup
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(relayPin, OUTPUT);
+
+    relayState = false;
+    digitalWrite(relayPin, relayState);
+
     Serial.begin(115200);
-    // put your setup code here, to run once:
+    // Set in station mode
+    WiFi.mode(WIFI_STA);
     reconnect_wifi();
-    //PmqttClient.setServer(mqtt_broker, mqtt_port);  // Sets the server details.
-    //PmqttClient.setCallback(callback);  // Sets the message callback function.
-    // set a will message, used by the broker when the connection dies unexpectedly
-    // you must know the size of the message beforehand, and it must be set before connecting
+
     String willPayload = "oh no!";
     bool willRetain = true;
     int willQos = 1;
@@ -145,9 +179,9 @@ void setup() {
     mqttClient.endWill();
 
     Serial.print("Attempting to connect to the MQTT broker: ");
-    Serial.println(mqtt_broker);
+    Serial.println(mqttBroker);
 
-    if (!mqttClient.connect(mqtt_broker, mqtt_port)) {
+    if (!mqttClient.connect(mqttBroker, mqtt_port)) {
         Serial.print("MQTT connection failed! Error code = ");
         Serial.println(mqttClient.connectError());
 
@@ -172,72 +206,66 @@ void setup() {
 
     // topics can be unsubscribed using:
     // mqttClient.unsubscribe(inTopic);
-    // NTP.begin(server1, server2, timeout)
-    //NTP.begin("ntp1.tecnico.ulisboa.pt", "pool.ntp.org", 10);
-    struct tm ntpTime;
-    /*
-       if (getLocalTime(&ntpTime)) {  // Return 1 when the time is successfully
-    // obtained.
-    ntpOK = true;
-    strftime(msg, MSG_BUFFER_SIZE, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    }
-    else{
-    Serial.println("Failed to obtain NTP time");
-    ntpOK = false;
-    }*/
-    setClock();
-    Serial.print("End Setup: ");
+    setClockNtp(10000);
+
+
+    Serial.println("End setup()");
+    ArduinoOTA.setHostname("PicoW");  // Set the network port name.  设置网络端口名称
+    ArduinoOTA.setPassword("666666");  // Set the network port connection
+    ArduinoOTA.begin();            // Initialize the OTA.  初始化OTA
+    Serial.println("OTA ready!");  // M5.lcd port output format str§
     delay(20);
 }
 
-void loopib() {
-    static  unsigned long lastMsg = 0;
-    Serial.println("End Setup: ");
-    delay(500);
-
-}
 void loop() {
     static  unsigned long lastMsg = 0;
-    unsigned long now = millis();
+    static  unsigned long lastWifiCheck = 0;
+    static  unsigned long lastLed = 0;
+
     StaticJsonDocument<256> doc;
+    struct tm timeinfo;
 
-    //  char buffer[256];
-    // serializeJson(doc, buffer);
-    //client.publish("outTopic", buffer);
-
-    /*
-       if (!PmqttClient.connected()) {
-       reConnect();
-       }
-       PmqttClient.loop();  // This function is called periodically to allow clients to
-       */
     // call poll() regularly to allow the library to receive MQTT messages and
     // send MQTT keep alives which avoids being disconnected by the broker
-    // mqttClient.poll();
+    mqttClient.poll();
 
+    unsigned long now = millis();
+    time_t nowTime = time(nullptr);
+
+    if (now > nextWater){
+        nextWater =  now + 24UL * 3600UL * 1000UL; // repeat next day
+        stopPump = now + waterAutoOn * 1000UL;
+        sumWater += waterAutoOn;
+        //led_state = true;
+        //digitalWrite(M5_LED, led_state);
+        digitalWrite(relayPin, HIGH);
+    }
+    if (now > stopPump){
+        digitalWrite(relayPin, LOW);
+        //led_state = false;
+        //digitalWrite(M5_LED, led_state);
+    }
+
+
+    if (now - lastWifiCheck > wifiPeriod) {
+        lastWifiCheck = now;
+        reconnect_wifi();
+    }
+
+    if(led_blink)
+        if (now - lastLed > ledPeriod) {
+            lastLed = now;
+            led_state = not led_state;
+            digitalWrite(LED_BUILTIN, led_state);
+        }
 
     if (now - lastMsg > msgPeriod) {
         lastMsg = now;
-        snprintf(msg, MSG_BUFFER_SIZE, "Watering ADC value: %ld",
-                now);
-        Serial.println(msg);
-        /*
-        //      PmqttClient.publish("ipfn/rega/rp", msg);  // Publishes a message to the specified
-        //timeClient.update();
-
-        //        Serial.println(timeClient.getFormattedTime());
-        String payload;
-
-        payload += "hello world!";
-        payload += " ";
-        payload += count;
-
-        Serial.print("Sending message to topic: ");
-        Serial.println(outTopic);
-        Serial.println(payload);
-
-        // send message, the Print interface can be used to set the message contents
-        // in this case we know the size ahead of time, so the message payload can be streamed
+        snprintf(msg, MSG_BUFFER_SIZE, "Water ADC: %ld, %lu",
+                now, nowTime);
+        Serial.print(msg);
+        Serial.print(" Wifi:");
+        Serial.println(wifiOK);
 
         bool retained = false;
         int qos = 1;
@@ -245,19 +273,19 @@ void loop() {
 
         float coreTemp =analogReadTemp();
 
-        doc["temp"] = coreTemp;
-        doc["count"]   = count++;
-        doc["payload"]   = payload;
+        doc["humidL"] = analogRead(HL_PIN);
+        doc["humidR"] = analogRead(HR_PIN);
 
-        //mqttClient.beginMessage(outTopic, payload.length(), retained, qos, dup);
+        gmtime_r(&nowTime, &timeinfo);
+        strftime(msg, MSG_BUFFER_SIZE, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+        doc["time"] = msg;
+        doc["temp"] = coreTemp;
+        doc["count"]   = nowTime;
+        //doc["payload"]   = payload;
+
         mqttClient.beginMessage(outTopic,  (unsigned long)measureJson(doc), retained, qos, dup);
         serializeJson(doc, mqttClient);
-        //mqttClient.print(payload);
         mqttClient.endMessage();
-
-*/
-        led_state = not led_state;
-        digitalWrite(LED_BUILTIN, led_state);
     }
 
 }
