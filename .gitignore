@@ -1,3 +1,5 @@
+# secrets
+include/arduino_secrets.h
 # Prerequisites
 *.d
 
