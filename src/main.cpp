@@ -54,10 +54,8 @@ bool willRetain = true;
 int willQos = 1;
 int subscribeQos = 1;
 
-WiFiClient wClient;
-
 // By default 'pool.ntp.org' is used with 60 seconds update interval and
-
+WiFiClient wClient;
 MqttClient mqttClient(wClient);
 
 bool led_state = false;
@@ -78,9 +76,10 @@ int wifiRetries = 0 ;
 bool ntpOK = false;
 bool relayState = false;
 
+unsigned long reboots;
 void onMqttMessage(int messageSize);
 
-void setup_mqtt(){
+int setupMqtt(){
     mqttClient.stop();
     delay(20);
     mqttClient.beginWill(willTopic, willPayload.length(), willRetain, willQos);
@@ -93,17 +92,17 @@ void setup_mqtt(){
     if (!mqttClient.connect(mqttBroker, mqtt_port)) {
         Serial.print("MQTT connection failed! Error code = ");
         Serial.println(mqttClient.connectError());
-
+        return -1;
     }
-
-    Serial.println("You're connected to the MQTT broker!");
+    else
+        Serial.println("You're connected to the MQTT broker!");
 
     // set the message receive callback
     mqttClient.onMessage(onMqttMessage);
 
     Serial.print("Subscribing to topic: ");
     Serial.println(inTopic);
-    Serial.println();
+    //Serial.println();
 
     // subscribe to a topic
     // the second parameter sets the QoS of the subscription,
@@ -112,24 +111,32 @@ void setup_mqtt(){
     mqttClient.subscribe(inTopic, subscribeQos);
     // topics can be unsubscribed using:
     // mqttClient.unsubscribe(inTopic);
+    return 0;
 }
 void reconnect_wifi(unsigned long nH2O) {
     delay(10);
     if (WiFi.status() == WL_CONNECTED && mqttClient.connected() == 1)
         return;
-    if(wifiRetries++ > 10){
+    Serial.print("No link. Wifi "); Serial.print(WiFi.status());
+    Serial.print(" MQTT "); Serial.println(mqttClient.connected());
+    mqttClient.unsubscribe(inTopic);
+    if(wifiRetries++ > 5){
+        // End setup(). Next H20 1671582148
         EEPROM.put(0x10, nH2O);
+        reboots++;
+        EEPROM.put(0x14, reboots);
         if (EEPROM.commit()) {
             Serial.println("EEPROM successfully committed");
         } else {
             Serial.println("ERROR! EEPROM commit failed");
         }
+        Serial.println("Rebooting....");
         rp2040.reboot();
     }
     wifiOK = 0;
     // We start by connecting to a WiFi network
     Serial.println();
-    Serial.print("Connecting to ");
+    Serial.print("Re-coonnecting to ");
     Serial.println(ssid);
 
     WiFi.disconnect();
@@ -139,7 +146,6 @@ void reconnect_wifi(unsigned long nH2O) {
     led_blink = true;
     ledPeriod = 500UL;
     for(int i = 0; i < WIFI_RETRY; i++){
-        //while (WiFi.status() != WL_CONNECTED)
         if (WiFi.status() != WL_CONNECTED) {
             Serial.print(".");
             led_state = not led_state;
@@ -149,17 +155,15 @@ void reconnect_wifi(unsigned long nH2O) {
         }
         else {
             wifiOK = 1;
-            wifiRetries = 0;
             led_state = true;
             //led_blink = true;
             ledPeriod = 2000UL;
-            //timeClient.begin();
             Serial.println("");
-            Serial.println("WiFi connected");
-            Serial.println("IP address: ");
+            Serial.print("WiFi connected, IP address: ");
             Serial.println(WiFi.localIP());
             digitalWrite(LED_BUILTIN, led_state);
-            setup_mqtt();
+            if(setupMqtt() == 0)
+                wifiRetries = 0;
             break;
         }
     }
@@ -242,7 +246,20 @@ void setup() {
     EEPROM.begin(256);
     unsigned long val;
     EEPROM.get(0x10, val);
-
+    EEPROM.get(0x14, reboots);
+        /*
+         * EEPROM.put(0x14, 0);
+        //EEPROM.put(0x10, ntpTime);
+        if (EEPROM.commit()) {
+            Serial.println("EEPROM successfully committed");
+        } else {
+            Serial.println("ERROR! EEPROM commit failed");
+        }
+*/
+    Serial.print("Reboots:  ");
+    Serial.println(reboots);
+    //Serial.print("Size:  ");
+    //Serial.println(sizeof(unsigned long));
     Serial.print("End setup(). Next H20 ");
     Serial.println(val);
     delay(20);
@@ -297,14 +314,7 @@ void loop() {
     int rawADC_HR, rawADC_HL;
     if (now - lastMsg > msgPeriod) {
         lastMsg = now;
-        /*
-        EEPROM.put(0x10, ntpTime);
-        if (EEPROM.commit()) {
-            Serial.println("EEPROM successfully committed");
-        } else {
-            Serial.println("ERROR! EEPROM commit failed");
-        }
-        */
+        
         rawADC_HR = analogRead(HR_PIN);
         rawADC_HL = analogRead(HL_PIN);
         snprintf(msg, MSG_BUFFER_SIZE, "Water ADC HL: %u, ADC HR: %u, %lu, ",
@@ -314,6 +324,7 @@ void loop() {
         Serial.print(msg);
         Serial.print(", Wifi:"); Serial.print(wifiOK);
         Serial.print(" mqttClient: "); Serial.print(mqttClient.connected());
+        Serial.print(" Reboots: "); Serial.print(reboots);
         Serial.print(" relay: "); Serial.println(relayState);
 
         bool retained = false;
@@ -329,6 +340,7 @@ void loop() {
         doc["tempCore"] = coreTemp;
         doc["count"]   = nowTime;
         doc["sumWater"] = sumWater;
+        doc["reboots"] = reboots;
         //doc["payload"]   = payload;
 
         mqttClient.beginMessage(outTopic,  (unsigned long) measureJson(doc), retained, qos, false);
