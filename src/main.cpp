@@ -20,6 +20,7 @@
 
 //#include <PicoOTA.h>
 #include <LittleFS.h>
+#include "hardware/gpio.h"
 
 //#define SECRET_SSID ""
 //#define SECRET_PASS ""
@@ -32,10 +33,12 @@ const int waterAutoOn = 60UL; // in sec. Auto water/ day
 
 const char *ssid = SECRET_SSID;
 const char *password = SECRET_PASS;
+#define PIN_D21              21
 
 const int HL_PIN = A0; // PICO pin 31
 const int HR_PIN = A1; // PICO pin 32
 const int relayPin = 22; // PICO pin 29
+unsigned int irqPin = PIN_D21;
 
 const int msgPeriod = 15 * 1000U;
 const int wifiPeriod = 300 * 1000U;
@@ -223,15 +226,31 @@ void onMqttMessage(int messageSize) {
        */
 
 }
+
+volatile int irqCount = 0;
+
+void gpio_callback(uint gpio, uint32_t events) {
+    // Put the GPIO event(s) that just happened into event_str
+    // so we can print it
+    //gpio_event_string(event_str, events);
+    irqCount++;
+    gpio_set_irq_enabled(irqPin, GPIO_IRQ_EDGE_FALL, false);
+    //Serial.println("GPIO %d %d\n", gpio, ++irqCount);
+}
+
 // The normal, core0 setup
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(relayPin, OUTPUT);
+    pinMode(irqPin, INPUT_PULLUP);
 
     relayState = false;
     digitalWrite(relayPin, relayState);
 
     Serial.begin(115200);
+    while (!Serial);
+    gpio_set_irq_enabled_with_callback(irqPin, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+
     // Set in station mode
     WiFi.mode(WIFI_STA);
     reconnect_wifi(0);
@@ -325,7 +344,10 @@ void loop() {
         Serial.print(", Wifi:"); Serial.print(wifiOK);
         Serial.print(" mqttClient: "); Serial.print(mqttClient.connected());
         Serial.print(" Reboots: "); Serial.print(reboots);
-        Serial.print(" relay: "); Serial.println(relayState);
+        Serial.print(" relay: "); Serial.print(relayState);
+		Serial.print(" GPIO irqs "); Serial.println(irqCount);
+		gpio_set_irq_enabled(irqPin, GPIO_IRQ_EDGE_FALL, true);
+
 
         bool retained = false;
         int qos = 1;
