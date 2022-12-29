@@ -1,5 +1,7 @@
 # secrets
 include/arduino_secrets.h
+# Platformio
+.pio/
 # Prerequisites
 *.d
 
