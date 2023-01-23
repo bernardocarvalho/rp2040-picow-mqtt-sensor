@@ -159,7 +159,10 @@ void reconnectWifi() {
     for(int i = 0; i < WIFI_RETRY; i++){
         if (WiFi.status() != WL_CONNECTED) {
             Serial.print(".");
-            ledState = not ledState;
+            ledState = false;
+            digitalWrite(LED_BUILTIN, ledState);
+            delay(100);
+            ledState = true;
             digitalWrite(LED_BUILTIN, ledState);
             delay(500);
             //continue;
@@ -249,6 +252,7 @@ void gpio_callback(uint gpio, uint32_t events) {
 // The normal, core0 setup
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
     pinMode(relayPin, OUTPUT);
     pinMode(irqPin, INPUT_PULLUP);
 
@@ -256,7 +260,8 @@ void setup() {
     digitalWrite(relayPin, relayState);
 
     Serial.begin(115200);
-    while (!Serial);
+    delay(500);
+    //while (!Serial);
     gpio_set_irq_enabled_with_callback(irqPin, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
     // Set in station mode
