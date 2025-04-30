@@ -15,11 +15,11 @@
 
 #include <ArduinoMqttClient.h>
 #include <ArduinoJson.h>
-#include <ArduinoOTA.h>
+//#include <ArduinoOTA.h>
 #include <EEPROM.h>
 
 //#include <PicoOTA.h>
-#include <LittleFS.h>
+//#include <LittleFS.h>
 #include "hardware/gpio.h"
 
 //#define SECRET_SSID ""
@@ -29,8 +29,20 @@
 #include "arduino_secrets.h"
 #endif
 
-const int waterAutoOn = 60UL; // in sec. Auto water/ day
+const unsigned int waterAutoOn = 120U; // in sec. Auto water/ day
+const unsigned int autoWater = 12 * 3600U; // Water cycle in s
 
+const long gmtOffset_sec     = 0;
+const int daylightOffset_sec = 0; // 3600;
+
+#define WIFI_RETRY 20
+
+#define MSG_BUFFER_SIZE 50
+
+#define NH2O_E_ADD 0x10
+#define SUMH2O_E_ADD 0x14
+#define CNTH2O_E_ADD 0x18
+#define REBOOTS_E_ADD 0x1C
 const char *ssid = SECRET_SSID;
 const char *password = SECRET_PASS;
 #define PIN_D21              21
@@ -40,9 +52,9 @@ const int HR_PIN = A1; // PICO pin 32
 const int relayPin = 22; // PICO pin 29
 unsigned int irqPin = PIN_D21;
 
-const int msgPeriod = 15 * 1000U;
-const int wifiPeriod = 300 * 1000U;
-int ledPeriod = 2 * 1000UL;
+const int msgPeriod = 30 * 1000U;
+const int wifiPeriod = 360 * 1000U;
+int ledPeriod = 2 * 1000U;
 
 const char* mqttBroker = "test.mosquitto.org";
 const int mqtt_port = 1883;  // Sets the server details.
@@ -63,23 +75,12 @@ MqttClient mqttClient(wClient);
 
 bool ledState = false;
 bool led_blink = false;
-// int count = 0;
 int irqCount, irqNext = 0;
 
 unsigned int sumWater = 0;
 unsigned long stopPump = 0, nextWater;
-
-const long gmtOffset_sec     = 0;
-const int daylightOffset_sec = 0; // 3600;
-
-#define WIFI_RETRY 20
-
-#define MSG_BUFFER_SIZE 50
-
-#define NH2O_E_ADD 0x10
-#define SUMH2O_E_ADD 0x14
-#define CNTH2O_E_ADD 0x18
-#define REBOOTS_E_ADD 0x1C
+unsigned long nextWifiCheck;
+unsigned long nextMsg = 0;
 
 int wifiOK = 0;
 int wifiRetries = 0 ;
@@ -118,31 +119,51 @@ int setupMqtt(){
     // the second parameter sets the QoS of the subscription,
     // the the library supports subscribing at QoS 0, 1, or 2
 
-    mqttClient.subscribe(inTopic, subscribeQos);
+    int rc = mqttClient.subscribe(inTopic, subscribeQos);
+    if(rc)
+        Serial.println("...Not Subscribed");
+    return rc;
     // topics can be unsubscribed using:
     // mqttClient.unsubscribe(inTopic);
+    //return 0;
+}
+int eeprom_save(){
+
+    EEPROM.put(NH2O_E_ADD, nextWater);
+    EEPROM.put(SUMH2O_E_ADD, sumWater);
+    EEPROM.put(CNTH2O_E_ADD, irqCount);
+    EEPROM.put(REBOOTS_E_ADD, reboots);
+    if (EEPROM.commit()) {
+        Serial.println("EEPROM successfully committed");
+    } else {
+        Serial.println("ERROR! EEPROM commit failed");
+    }
     return 0;
 }
 void reconnectWifi() {
-    delay(10);
-    if (WiFi.status() == WL_CONNECTED && mqttClient.connected() == 1)
-        return;
-    Serial.print("No link. Wifi "); Serial.print(WiFi.status());
+    delay(300);
+    if (WiFi.status() == WL_CONNECTED)
+        if (mqttClient.connected() == 1)
+            return;
+        else {
+            mqttClient.unsubscribe(inTopic);
+            Serial.print("No mqttClient, ");
+        }
+
+    Serial.print(" No link. Wifi "); Serial.print(WiFi.status());
     Serial.print(" MQTT "); Serial.println(mqttClient.connected());
     mqttClient.unsubscribe(inTopic);
+    mqttClient.flush();
+    mqttClient.stop();
+    delay(3000);
     if(wifiRetries++ > 5){
+        WiFi.disconnect();
         // End setup(). Next H20 1671582148
-        EEPROM.put(NH2O_E_ADD, nextWater);
-        EEPROM.put(SUMH2O_E_ADD, sumWater);
-        EEPROM.put(CNTH2O_E_ADD, irqCount);
+        eeprom_save();
         reboots++;
-        EEPROM.put(REBOOTS_E_ADD, reboots);
-        if (EEPROM.commit()) {
-            Serial.println("EEPROM successfully committed");
-        } else {
-            Serial.println("ERROR! EEPROM commit failed");
-        }
+        //EEPROM.commit();
         Serial.println("Rebooting....");
+        delay(30000UL);
         rp2040.reboot();
     }
     wifiOK = 0;
@@ -168,7 +189,6 @@ void reconnectWifi() {
             //continue;
         }
         else {
-            wifiOK = 1;
             ledState = true;
             //led_blink = true;
             ledPeriod = 2000UL;
@@ -176,9 +196,15 @@ void reconnectWifi() {
             Serial.print("WiFi connected, IP address: ");
             Serial.println(WiFi.localIP());
             digitalWrite(LED_BUILTIN, ledState);
-            if(setupMqtt() == 0)
+            if(setupMqtt() == 0) {
+                wifiOK = 1;
                 wifiRetries = 0;
-            break;
+                break;
+            }
+            else {
+                //WiFi.disconnect();
+                delay(2000);
+            }
         }
     }
 }
@@ -224,9 +250,27 @@ void onMqttMessage(int messageSize) {
     unsigned long ntpTime = nowTime;
     if (pump == 1){
         nextWater = ntpTime + 1;
+        Serial.print("\"pump\":");
+        Serial.println(pump);
     }
-    Serial.print("\"pump\":");
-    Serial.println(pump);
+    nextMsg = millis() + 1000UL;
+    int save = doc["save"];
+
+    if (save == 1) {
+        eeprom_save();
+        Serial.print("\"save\":");
+        Serial.println(save);
+    }
+    int reset = doc["reset"];
+    if (reset == 1) {
+        nextWater = 0;
+        sumWater = 0;
+        irqCount = 0;
+        reboots = 0;
+        Serial.println("MQTT reset");
+        eeprom_save();
+    }
+
     //Serial.println();
 
     // use the Stream interface to print the contents
@@ -267,23 +311,23 @@ void setup() {
     // Set in station mode
     WiFi.mode(WIFI_STA);
     reconnectWifi();
-
     setClockNtp(10000);
     time_t nowTime = time(nullptr);
     unsigned long ntpTime = nowTime;
 
-    ArduinoOTA.setHostname("PicoW");  // Set the network port name.  设置网络端口名称
-    ArduinoOTA.setPassword("666666");  // Set the network port connection
-    ArduinoOTA.begin();            // Initialize the OTA.  初始化OTA
-    Serial.println("OTA ready!");  // M5.lcd port output format str§
-    nextWater =  ntpTime + 24UL * 3600UL; // start next day
-    EEPROM.begin(256);
-    // unsigned long val;
+    nextWifiCheck = millis() + 3600000UL;
+    //ArduinoOTA.setHostname("PicoW");  // Set the network port name.  设置网络端口名称
+    //ArduinoOTA.setPassword("666666");  // Set the network port connection
+    //ArduinoOTA.begin();            // Initialize the OTA.  初始化OTA
+    //Serial.println("OTA ready!");  // M5.lcd port output format str§
+    nextWater =  ntpTime + autoWater; //24UL * 3600UL; // start next day
+    EEPROM.begin(64);
     /*
     EEPROM.put(NH2O_E_ADD, nextWater);
     EEPROM.put(SUMH2O_E_ADD, 0);
     EEPROM.put(CNTH2O_E_ADD, 0);
     EEPROM.put(REBOOTS_E_ADD, 0);
+    EEPROM.commit();
     if (EEPROM.commit()) {
         Serial.println("EEPROM successfully committed");
     } else {
@@ -304,8 +348,6 @@ void setup() {
 }
 
 void loop() {
-    static  unsigned long lastMsg = 0;
-    static  unsigned long lastWifiCheck = 0;
     static  unsigned long lastLed = 0;
     char msg[MSG_BUFFER_SIZE];
 
@@ -322,7 +364,8 @@ void loop() {
     gmtime_r(&nowTime, &timeinfo);
 
     if (ntpTime > nextWater){
-        nextWater =  ntpTime + 24UL * 3600UL; // repeat next day
+        nextWater =  ntpTime + autoWater;
+        //nextWater =  ntpTime + 24UL * 3600UL; // repeat next day
         stopPump = now + waterAutoOn * 1000UL;
         sumWater += waterAutoOn;
         relayState = true;
@@ -333,13 +376,14 @@ void loop() {
         digitalWrite(relayPin, relayState);
     }
     if (now > irqNext){
-        gpio_set_irq_enabled(irqPin, GPIO_IRQ_EDGE_FALL, true);
-        irqNext = millis() + 60 * 2000UL;
+        gpio_set_irq_enabled_with_callback(irqPin, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+        //gpio_set_irq_enabled(irqPin, GPIO_IRQ_EDGE_FALL, true);
+        irqNext = millis() + 60 * 1000UL;
     }
 
 
-    if (now - lastWifiCheck > wifiPeriod) {
-        lastWifiCheck = now;
+    if (now  > nextWifiCheck) {
+        nextWifiCheck = now + wifiPeriod;
         reconnectWifi();
     }
 
@@ -351,8 +395,8 @@ void loop() {
         }
 
     int rawADC_HR, rawADC_HL;
-    if (now - lastMsg > msgPeriod) {
-        lastMsg = now;
+    if (now > nextMsg) {
+        nextMsg = now + msgPeriod;
 
         rawADC_HR = analogRead(HR_PIN);
         rawADC_HL = analogRead(HL_PIN);
@@ -380,6 +424,8 @@ void loop() {
         doc["tempCore"] = coreTemp;
         doc["count"]   = nowTime;
         doc["sumWater"] = sumWater;
+        doc["waterIn"] = (nextWater - ntpTime);
+        doc["waterInMin"] = (nextWater - ntpTime)/60;
         doc["reboots"] = reboots;
         //doc["payload"]   = payload;
 
